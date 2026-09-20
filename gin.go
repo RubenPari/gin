@@ -13,6 +13,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin/internal/bytesconv"
 	filesystem "github.com/gin-gonic/gin/internal/fs"
@@ -28,6 +29,12 @@ const (
 	colon                  = ":"
 	backslash              = "\\"
 )
+
+// defaultReadHeaderTimeout is the default ReadHeaderTimeout applied to the
+// http.Server created by Run, RunTLS and RunListener. It protects against
+// slowloris-style resource exhaustion when the caller does not configure a
+// custom http.Server.
+const defaultReadHeaderTimeout = 10 * time.Second
 
 var (
 	default404Body = []byte("404 page not found")
@@ -173,6 +180,12 @@ type Engine struct {
 	// method call.
 	MaxMultipartMemory int64
 
+	// ReadHeaderTimeout is the maximum duration allowed for reading the request
+	// headers by the http.Server created through Run, RunTLS and RunListener.
+	// If zero or negative, a default of 10 seconds is used. Set to a positive
+	// value to customize, or use a custom http.Server directly to disable it.
+	ReadHeaderTimeout time.Duration
+
 	// UseH2C enable h2c support.
 	UseH2C bool
 
@@ -226,6 +239,7 @@ func New(opts ...OptionFunc) *Engine {
 		RemoveExtraSlash:       false,
 		UnescapePathValues:     true,
 		MaxMultipartMemory:     defaultMultipartMemory,
+		ReadHeaderTimeout:      defaultReadHeaderTimeout,
 		trees:                  make(methodTrees, 0, 9),
 		delims:                 render.Delims{Left: "{{", Right: "}}"},
 		secureJSONPrefix:       "while(1);",
@@ -260,6 +274,15 @@ func (engine *Engine) allocateContext(maxParams uint16) *Context {
 	v := make(Params, 0, maxParams)
 	skippedNodes := make([]skippedNode, 0, engine.maxSections)
 	return &Context{engine: engine, params: &v, skippedNodes: &skippedNodes}
+}
+
+// getReadHeaderTimeout returns the configured ReadHeaderTimeout, or the
+// default if it is zero or negative.
+func (engine *Engine) getReadHeaderTimeout() time.Duration {
+	if engine.ReadHeaderTimeout <= 0 {
+		return defaultReadHeaderTimeout
+	}
+	return engine.ReadHeaderTimeout
 }
 
 // Delims sets template left and right delims and returns an Engine instance.
@@ -548,6 +571,9 @@ func parseIP(ip string) net.IP {
 // Run attaches the router to a http.Server and starts listening and serving HTTP requests.
 // It is a shortcut for http.ListenAndServe(addr, router)
 // Note: this method will block the calling goroutine indefinitely unless an error happens.
+// The created http.Server is configured with a default ReadHeaderTimeout of 10 seconds
+// (configurable via Engine.ReadHeaderTimeout) to mitigate slowloris attacks.
+// For full control over timeouts, create a custom http.Server and use ServeHTTP.
 func (engine *Engine) Run(addr ...string) (err error) {
 	defer func() { debugPrintError(err) }()
 
@@ -559,8 +585,9 @@ func (engine *Engine) Run(addr ...string) (err error) {
 	address := resolveAddress(addr)
 	debugPrint("Listening and serving HTTP on %s\n", address)
 	server := &http.Server{ // #nosec G112
-		Addr:    address,
-		Handler: engine.Handler(),
+		Addr:              address,
+		Handler:           engine.Handler(),
+		ReadHeaderTimeout: engine.getReadHeaderTimeout(),
 	}
 	err = server.ListenAndServe()
 	return
@@ -579,8 +606,9 @@ func (engine *Engine) RunTLS(addr, certFile, keyFile string) (err error) {
 	}
 
 	server := &http.Server{ // #nosec G112
-		Addr:    addr,
-		Handler: engine.Handler(),
+		Addr:              addr,
+		Handler:           engine.Handler(),
+		ReadHeaderTimeout: engine.getReadHeaderTimeout(),
 	}
 	err = server.ListenAndServeTLS(certFile, keyFile)
 	return
@@ -663,7 +691,8 @@ func (engine *Engine) RunListener(listener net.Listener) (err error) {
 	}
 
 	server := &http.Server{ // #nosec G112
-		Handler: engine.Handler(),
+		Handler:           engine.Handler(),
+		ReadHeaderTimeout: engine.getReadHeaderTimeout(),
 	}
 	err = server.Serve(listener)
 	return
